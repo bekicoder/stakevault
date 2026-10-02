@@ -9,12 +9,16 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol
 
 /// @title StakingVault
 /// @notice Stake a token and earn the same token as rewards, streamed linearly over a fixed duration.
-/// @dev Reward accounting follows the well-known "rewardPerToken" pattern. Withdrawals stay
-///      available while paused so users can never be locked in.
+/// @dev v2 adds an optional lock period with an early-withdrawal fee paid to a treasury.
+///      The fee policy is off by default (lockPeriod = 0, fee = 0), so v1 behaviour is unchanged
+///      until the owner calls `setWithdrawalPolicy`. Withdrawals stay available while paused.
+///      Note: every new stake restarts that user's lock timer (documented trade-off).
 contract StakingVault is Ownable, Pausable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
     uint256 private constant PRECISION = 1e18;
+    uint256 public constant BPS = 10_000;
+    uint256 public constant MAX_EARLY_WITHDRAW_FEE_BPS = 1_000; // 10%
 
     IERC20 public immutable token;
     uint256 public immutable rewardsDuration;
@@ -29,18 +33,30 @@ contract StakingVault is Ownable, Pausable, ReentrancyGuard {
     mapping(address => uint256) public userRewardPerTokenPaid;
     mapping(address => uint256) public rewards;
 
+    // ───────────── v2 state ─────────────
+    uint256 public lockPeriod;
+    uint256 public earlyWithdrawFeeBps;
+    address public treasury;
+    mapping(address => uint256) public lastStakeTime;
+
     event Staked(address indexed user, uint256 amount);
     event Withdrawn(address indexed user, uint256 amount);
     event RewardPaid(address indexed user, uint256 reward);
     event RewardAdded(uint256 reward, uint256 newRewardRate, uint256 periodFinish);
+    event EarlyWithdrawalFee(address indexed user, uint256 fee);
+    event WithdrawalPolicyUpdated(uint256 lockPeriod, uint256 earlyWithdrawFeeBps);
+    event TreasuryUpdated(address indexed treasury);
 
     error ZeroAmount();
+    error ZeroAddress();
     error InsufficientBalance(uint256 requested, uint256 available);
     error RewardTooSmall();
+    error FeeTooHigh(uint256 maxBps);
 
     constructor(IERC20 _token, address initialOwner, uint256 _rewardsDuration) Ownable(initialOwner) {
         token = _token;
         rewardsDuration = _rewardsDuration;
+        treasury = initialOwner;
     }
 
     modifier updateReward(address account) {
@@ -70,12 +86,24 @@ contract StakingVault is Ownable, Pausable, ReentrancyGuard {
             + rewards[account];
     }
 
+    /// @notice Timestamp after which `account` can withdraw without a fee.
+    function unlockTime(address account) public view returns (uint256) {
+        return lastStakeTime[account] + lockPeriod;
+    }
+
+    /// @notice Fee that would be charged if `account` withdrew `amount` right now.
+    function earlyWithdrawalFee(address account, uint256 amount) public view returns (uint256) {
+        if (earlyWithdrawFeeBps == 0 || block.timestamp >= unlockTime(account)) return 0;
+        return (amount * earlyWithdrawFeeBps) / BPS;
+    }
+
     // ───────────── User actions ─────────────
 
     function stake(uint256 amount) external nonReentrant whenNotPaused updateReward(msg.sender) {
         if (amount == 0) revert ZeroAmount();
         totalStaked += amount;
         balanceOf[msg.sender] += amount;
+        lastStakeTime[msg.sender] = block.timestamp;
         token.safeTransferFrom(msg.sender, address(this), amount);
         emit Staked(msg.sender, amount);
     }
@@ -84,9 +112,17 @@ contract StakingVault is Ownable, Pausable, ReentrancyGuard {
         if (amount == 0) revert ZeroAmount();
         uint256 bal = balanceOf[msg.sender];
         if (amount > bal) revert InsufficientBalance(amount, bal);
+
+        uint256 fee = earlyWithdrawalFee(msg.sender, amount);
+
         totalStaked -= amount;
         balanceOf[msg.sender] = bal - amount;
-        token.safeTransfer(msg.sender, amount);
+
+        if (fee > 0) {
+            token.safeTransfer(treasury, fee);
+            emit EarlyWithdrawalFee(msg.sender, fee);
+        }
+        token.safeTransfer(msg.sender, amount - fee);
         emit Withdrawn(msg.sender, amount);
     }
 
@@ -121,6 +157,20 @@ contract StakingVault is Ownable, Pausable, ReentrancyGuard {
         lastUpdateTime = block.timestamp;
         periodFinish = block.timestamp + rewardsDuration;
         emit RewardAdded(reward, rewardRate, periodFinish);
+    }
+
+    /// @notice Configure the lock period (seconds) and early-withdrawal fee (basis points, max 10%).
+    function setWithdrawalPolicy(uint256 _lockPeriod, uint256 _feeBps) external onlyOwner {
+        if (_feeBps > MAX_EARLY_WITHDRAW_FEE_BPS) revert FeeTooHigh(MAX_EARLY_WITHDRAW_FEE_BPS);
+        lockPeriod = _lockPeriod;
+        earlyWithdrawFeeBps = _feeBps;
+        emit WithdrawalPolicyUpdated(_lockPeriod, _feeBps);
+    }
+
+    function setTreasury(address _treasury) external onlyOwner {
+        if (_treasury == address(0)) revert ZeroAddress();
+        treasury = _treasury;
+        emit TreasuryUpdated(_treasury);
     }
 
     function pause() external onlyOwner {
